@@ -1849,13 +1849,35 @@ export const createTerminalSlice: StateCreator<AppState, [], [], TerminalSlice> 
       }
     }
 
-    const clearTargetSuppressions = (): void => {
+    // Why: the pane's exit handler consults sleepingAgentSessionsByPaneKey to
+    // tell a hibernation kill from other suppressed exits. pty:exit can reach
+    // the renderer before the kill promise resolves, so the record must be in
+    // the store BEFORE the kill is issued — and rolled back if the kill fails.
+    const sleepingRecordKeys = Object.keys(sleepingAgentSessionRecords)
+    const replacedSleepingRecords: Record<string, (typeof sleepingAgentSessionRecords)[string]> = {}
+    for (const key of sleepingRecordKeys) {
+      const existing = state.sleepingAgentSessionsByPaneKey[key]
+      if (existing) {
+        replacedSleepingRecords[key] = existing
+      }
+    }
+
+    const rollbackTargetShutdownState = (): void => {
       set((s) => {
         const next = { ...s.suppressedPtyExitIds }
         for (const ptyId of shutdownPtyIds) {
           delete next[ptyId]
         }
-        return { suppressedPtyExitIds: next }
+        const nextSleeping = { ...s.sleepingAgentSessionsByPaneKey }
+        for (const key of sleepingRecordKeys) {
+          const replaced = replacedSleepingRecords[key]
+          if (replaced) {
+            nextSleeping[key] = replaced
+          } else {
+            delete nextSleeping[key]
+          }
+        }
+        return { suppressedPtyExitIds: next, sleepingAgentSessionsByPaneKey: nextSleeping }
       })
     }
 
@@ -1863,13 +1885,17 @@ export const createTerminalSlice: StateCreator<AppState, [], [], TerminalSlice> 
       suppressedPtyExitIds: {
         ...s.suppressedPtyExitIds,
         ...Object.fromEntries(shutdownPtyIds.map((ptyId) => [ptyId, true] as const))
+      },
+      sleepingAgentSessionsByPaneKey: {
+        ...s.sleepingAgentSessionsByPaneKey,
+        ...sleepingAgentSessionRecords
       }
     }))
 
     if (expectedRuntimePtyIds.length > 0) {
       const runtimeEnvironmentId = resolveTerminalStopRuntimeEnvironmentId(get(), worktreeId)
       if (!runtimeEnvironmentId) {
-        clearTargetSuppressions()
+        rollbackTargetShutdownState()
         throw new Error('missing_runtime_for_exact_terminal_stop')
       }
       let stopResult: {
@@ -1896,18 +1922,18 @@ export const createTerminalSlice: StateCreator<AppState, [], [], TerminalSlice> 
           { timeoutMs: 15_000 }
         )
       } catch (err) {
-        clearTargetSuppressions()
+        rollbackTargetShutdownState()
         throw err
       }
       const stoppedPtyIds = sortedUniquePtyIds(stopResult.stoppedPtyIds)
       const livePtyIds = sortedUniquePtyIds(stopResult.livePtyIds)
       const targetWasLive = expectedRuntimePtyIds.every((ptyId) => livePtyIds.includes(ptyId))
       if (!equalStringSets(stoppedPtyIds, expectedRuntimePtyIds) || !targetWasLive) {
-        clearTargetSuppressions()
+        rollbackTargetShutdownState()
         throw new Error('exact_terminal_stop_mismatch')
       }
       if (stopResult.postStopVerified !== true) {
-        clearTargetSuppressions()
+        rollbackTargetShutdownState()
         throw new Error(stopResult.postStopFailure ?? 'exact_terminal_stop_unverified')
       }
       unregisterPtyDataHandlers(shutdownPtyIds)
@@ -1919,7 +1945,7 @@ export const createTerminalSlice: StateCreator<AppState, [], [], TerminalSlice> 
         await window.api.pty.kill(opts.ptyId, { keepHistory: true })
       } catch (err) {
         restorePtyDataHandlersAfterFailedShutdown(handlerSnapshots)
-        clearTargetSuppressions()
+        rollbackTargetShutdownState()
         throw err
       }
     }
@@ -1995,13 +2021,6 @@ export const createTerminalSlice: StateCreator<AppState, [], [], TerminalSlice> 
         lastTerminalInputAtByPaneKey: nextLastTerminalInputAtByPaneKey
       }
     })
-
-    set((s) => ({
-      sleepingAgentSessionsByPaneKey: {
-        ...s.sleepingAgentSessionsByPaneKey,
-        ...sleepingAgentSessionRecords
-      }
-    }))
 
     get().dropHibernatedAgentStatusPane(worktreeId, opts.paneKey, {
       retainedCompletionEvidence

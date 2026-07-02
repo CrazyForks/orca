@@ -1080,6 +1080,10 @@ describe('connectPanePty', () => {
 
     const onPtyExit = createdTransportOptions[0]?.onPtyExit as ((ptyId: string) => void) | undefined
     expect(onPtyExit).toBeTypeOf('function')
+    // The deferred connect attached this transport to the persisted tab PTY,
+    // so the hibernation kill's exit must carry that id for the wake guard's
+    // same-pty check to model reality.
+    expect((transport.getPtyId as unknown as () => string | null)()).toBe('tab-pty')
     const connectCallsBeforeExit = transport.connect.mock.calls.length
     onPtyExit?.('tab-pty')
     await flushAsyncTicks()
@@ -1146,6 +1150,10 @@ describe('connectPanePty', () => {
 
     const onPtyExit = createdTransportOptions[0]?.onPtyExit as ((ptyId: string) => void) | undefined
     expect(onPtyExit).toBeTypeOf('function')
+    // The deferred connect attached this transport to the persisted tab PTY,
+    // so the hibernation kill's exit must carry that id for the wake guard's
+    // same-pty check to model reality.
+    expect((transport.getPtyId as unknown as () => string | null)()).toBe('tab-pty')
     const connectCallsBeforeExit = transport.connect.mock.calls.length
     onPtyExit?.('tab-pty')
     await flushAsyncTicks()
