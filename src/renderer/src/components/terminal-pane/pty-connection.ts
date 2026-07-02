@@ -1702,6 +1702,32 @@ export function connectPanePty(
   // it and relaunches the recorded agent session on next reveal.
   let hibernatedWakePtyId: string | null = null
   let wakeHibernatedAgentPane: (() => void) | null = null
+  // Why: reveal is the normal wake trigger, but a reveal that lands *during* the
+  // in-flight hibernation kill runs noteVisibilityResume before onExit arms the
+  // wake. Sharing the guarded consume lets both the reveal hook and the
+  // arm-time foreground check resume the pane exactly once.
+  const consumeHibernatedAgentWake = (): void => {
+    if (hibernatedWakePtyId === null || disposed) {
+      return
+    }
+    if (deps.paneTransportsRef.current.get(pane.id) !== transport) {
+      return
+    }
+    const currentPtyId = transport.getPtyId()
+    // Why: a real pty:exit clears the transport's ptyId before onExit while a
+    // reconcile-driven exit leaves it bound; both mean "nothing respawned since
+    // hibernation". A different non-null id means another flow (e.g. an
+    // intentional restart) already rebound the pane — its spawn wins.
+    if (currentPtyId !== null && currentPtyId !== hibernatedWakePtyId) {
+      hibernatedWakePtyId = null
+      return
+    }
+    hibernatedWakePtyId = null
+    // Why: reveal is the wake signal for a hibernated pane. Resume the recorded
+    // agent session (or fall back to a fresh shell) instead of leaving the
+    // frozen frame with no PTY behind it.
+    wakeHibernatedAgentPane?.()
+  }
   const onExit = (ptyId: string): void => {
     if (handledExitPtyId === ptyId) {
       return
@@ -1751,6 +1777,13 @@ export function connectPanePty(
         // modes now and arm the reveal-time wake.
         replayIntoTerminal(pane, deps.replayingPanesRef, POST_REPLAY_MODE_RESET)
         hibernatedWakePtyId = ptyId
+        if (deps.isVisibleRef.current) {
+          // Why: a reveal that raced this kill already ran noteVisibilityResume
+          // before the exit landed, so it saw nothing armed. Consume the wake
+          // now (deferred off the exit handler) so a foreground pane still
+          // resumes without needing a second hide/reveal.
+          queueMicrotask(consumeHibernatedAgentWake)
+        }
       }
       return
     }
@@ -5476,26 +5509,7 @@ export function connectPanePty(
     // xterm's transient hidden DOM fallback.
     noteVisibilityResume() {
       ptySizeReassertion.request({ fit: false })
-      if (hibernatedWakePtyId === null || disposed) {
-        return
-      }
-      if (deps.paneTransportsRef.current.get(pane.id) !== transport) {
-        return
-      }
-      const currentPtyId = transport.getPtyId()
-      // Why: a real pty:exit clears the transport's ptyId before onExit while
-      // a reconcile-driven exit leaves it bound; both mean "nothing respawned
-      // since hibernation". A different non-null id means another flow (e.g.
-      // an intentional restart) already rebound the pane — its spawn wins.
-      if (currentPtyId !== null && currentPtyId !== hibernatedWakePtyId) {
-        hibernatedWakePtyId = null
-        return
-      }
-      hibernatedWakePtyId = null
-      // Why: reveal is the wake signal for a hibernated pane. Resume the
-      // recorded agent session (or fall back to a fresh shell) instead of
-      // leaving the frozen frame with no PTY behind it.
-      wakeHibernatedAgentPane?.()
+      consumeHibernatedAgentWake()
     },
     reconcileIfSessionDead,
     reconcileIfSessionMissing,

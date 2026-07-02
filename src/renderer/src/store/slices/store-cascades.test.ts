@@ -2840,6 +2840,69 @@ describe('shutdownWorktreeTerminals (sleep) — agent status hygiene', () => {
     expect(dropByWorktree).not.toHaveBeenCalled()
   })
 
+  it('aborts pane hibernation without side effects when no resume record can be captured', async () => {
+    // The prod ghost pane was killed with NO sleeping record captured, so
+    // nothing could ever wake it. Planner eligibility can go stale between
+    // ticks, so the shutdown must throw before any suppression or kill when the
+    // capture comes back empty (a done agent with no resumable provider
+    // session), leaving the pane fully intact for a later retry.
+    const store = createTestStore()
+    const wt = 'repo1::/path/wt1'
+    const targetLeaf = '11111111-1111-4111-8111-111111111111'
+    const siblingLeaf = '22222222-2222-4222-8222-222222222222'
+    const targetPaneKey = `tab-1:${targetLeaf}`
+
+    seedStore(store, {
+      worktreesByRepo: {
+        repo1: [makeWorktree({ id: wt, repoId: 'repo1', path: '/path/wt1' })]
+      },
+      tabsByWorktree: {
+        [wt]: [makeTab({ id: 'tab-1', worktreeId: wt, title: 'Codex', ptyId: 'pty-agent' })]
+      },
+      terminalLayoutsByTabId: {
+        'tab-1': {
+          root: {
+            type: 'split',
+            direction: 'horizontal',
+            first: { type: 'leaf', leafId: targetLeaf },
+            second: { type: 'leaf', leafId: siblingLeaf }
+          },
+          activeLeafId: siblingLeaf,
+          expandedLeafId: null,
+          ptyIdsByLeafId: { [targetLeaf]: 'pty-agent', [siblingLeaf]: 'pty-shell' }
+        }
+      },
+      ptyIdsByTabId: { 'tab-1': ['pty-agent', 'pty-shell'] }
+    })
+    // A done agent with no provider session yields no resumable sleeping record.
+    store
+      .getState()
+      .setAgentStatus(
+        targetPaneKey,
+        { state: 'done', prompt: 'resume target', agentType: 'codex' },
+        'Codex',
+        { updatedAt: 2000, stateStartedAt: 1000 },
+        { tabId: 'tab-1', worktreeId: wt }
+      )
+
+    await expect(
+      store.getState().shutdownCompletedAgentPaneForHibernation(wt, {
+        paneKey: targetPaneKey,
+        tabId: 'tab-1',
+        leafId: targetLeaf,
+        ptyId: 'pty-agent'
+      })
+    ).rejects.toThrow('agent_hibernation_capture_missing')
+
+    const state = store.getState()
+    // Nothing was suppressed, killed, or persisted — the pane is untouched.
+    expect(mockApi.pty.kill).not.toHaveBeenCalled()
+    expect(state.suppressedPtyExitIds['pty-agent']).toBeUndefined()
+    expect(state.sleepingAgentSessionsByPaneKey[targetPaneKey]).toBeUndefined()
+    expect(state.ptyIdsByTabId['tab-1']).toEqual(['pty-agent', 'pty-shell'])
+    expect(state.agentStatusByPaneKey[targetPaneKey]).toBeDefined()
+  })
+
   it('keeps manual sleep worktree-wide', async () => {
     const store = createTestStore()
     const wt = 'repo1::/path/wt1'
