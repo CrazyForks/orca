@@ -1041,6 +1041,70 @@ describe('connectPanePty', () => {
     expect(manager.closePane).not.toHaveBeenCalled()
   })
 
+  it('disarms input modes and resumes a hibernated agent session on visibility reveal', async () => {
+    // Regression: agent hibernation suppresses its kill's PTY exit while the
+    // pane is hidden. Before the wake fix, onExit consumed the suppression and
+    // permanently latched handledExitPtyId, so revealing the tab left a frozen
+    // alt-screen frame with mouse-tracking armed and no PTY — a fully inert
+    // ghost pane (no resume, no input, no selection).
+    const { connectPanePty } = await import('./pty-connection')
+    const transport = createMockTransport('pty-pane-2')
+    transportFactoryQueue.push(transport)
+    const manager = createManager(1)
+    const deps = createDeps({
+      consumeSuppressedPtyExit: vi.fn(() => true)
+    })
+    const pane = createPane(2)
+    const paneKey = `tab-1:${leafIdForPane(2)}`
+    mockStoreState.sleepingAgentSessionsByPaneKey[paneKey] = {
+      paneKey,
+      tabId: 'tab-1',
+      worktreeId: 'wt-1',
+      agent: 'claude',
+      providerSession: { key: 'session_id', id: 'sess-hibernated-1' },
+      prompt: 'test prompt',
+      state: 'done',
+      capturedAt: 1,
+      updatedAt: 1,
+      origin: 'worktree-sleep'
+    }
+
+    const binding = connectPanePty(pane as never, manager as never, deps as never) as unknown as {
+      noteVisibilityResume: () => void
+      dispose: () => void
+    }
+    await flushAsyncTicks()
+
+    const onPtyExit = createdTransportOptions[0]?.onPtyExit as ((ptyId: string) => void) | undefined
+    expect(onPtyExit).toBeTypeOf('function')
+    const connectCallsBeforeExit = transport.connect.mock.calls.length
+    onPtyExit?.('tab-pty')
+
+    // The frozen frame's input-eating modes are disarmed at hibernation-exit
+    // time (mouse tracking / bracketed paste would otherwise swallow clicks).
+    const writesAfterExit = pane.terminal.write.mock.calls.flat().join('')
+    expect(writesAfterExit).toContain('\x1b[?1003l')
+    expect(writesAfterExit).toContain('\x1b[?2004l')
+    // Hibernation must not immediately respawn — wake waits for reveal.
+    expect(transport.connect.mock.calls.length).toBe(connectCallsBeforeExit)
+
+    binding.noteVisibilityResume()
+    await flushAsyncTicks()
+
+    expect(transport.connect.mock.calls.length).toBeGreaterThan(connectCallsBeforeExit)
+    const resumeConnectOptions = transport.connect.mock.calls.at(-1)?.[0] as
+      | { command?: string }
+      | undefined
+    expect(resumeConnectOptions?.command).toContain('--resume')
+    expect(resumeConnectOptions?.command).toContain('sess-hibernated-1')
+
+    // The wake is one-shot: a second reveal must not spawn again.
+    const connectCallsAfterWake = transport.connect.mock.calls.length
+    binding.noteVisibilityResume()
+    await flushAsyncTicks()
+    expect(transport.connect.mock.calls.length).toBe(connectCallsAfterWake)
+  })
+
   it('keeps a fresh split pane mounted when its newborn PTY exits before output or input', async () => {
     const { connectPanePty } = await import('./pty-connection')
     const transport = createMockTransport('pty-pane-2')

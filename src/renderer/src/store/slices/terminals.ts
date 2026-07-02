@@ -1833,6 +1833,12 @@ export const createTerminalSlice: StateCreator<AppState, [], [], TerminalSlice> 
       worktreeId,
       paneKeys
     )
+    if (!sleepingAgentSessionRecords[opts.paneKey]) {
+      // Why: killing the PTY without a persisted resume record strands the
+      // pane — nothing can ever wake it. Planner eligibility can go stale
+      // between ticks; abort this round instead of hibernating unrecoverably.
+      throw new Error('agent_hibernation_capture_missing')
+    }
 
     const capture = shutdownBufferCaptures.get(opts.tabId)
     if (capture) {
