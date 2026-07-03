@@ -1174,6 +1174,63 @@ describe('connectPanePty', () => {
     expect(transport.connect.mock.calls.length).toBe(connectCallsAfterWake)
   })
 
+  it('invalidates the hibernation wake when another flow rebinds the pane before reveal', async () => {
+    // Intentional restarts use the same exit suppression as hibernation. When
+    // one rebinds the pane to a fresh PTY while hidden, its spawn owns the
+    // pane: the armed wake must be discarded on reveal instead of launching a
+    // second resume over the restarted session — and discarded means gone, so
+    // a later death of the rebound PTY cannot revive the stale wake either.
+    const { connectPanePty } = await import('./pty-connection')
+    const transport = createMockTransport('pty-pane-2')
+    transportFactoryQueue.push(transport)
+    const manager = createManager(1)
+    const deps = createDeps({
+      consumeSuppressedPtyExit: vi.fn(() => true),
+      isVisibleRef: { current: false }
+    })
+    const pane = createPane(2)
+    const paneKey = `tab-1:${leafIdForPane(2)}`
+    mockStoreState.sleepingAgentSessionsByPaneKey[paneKey] = {
+      paneKey,
+      tabId: 'tab-1',
+      worktreeId: 'wt-1',
+      agent: 'claude',
+      providerSession: { key: 'session_id', id: 'sess-hibernated-3' },
+      prompt: 'test prompt',
+      state: 'done',
+      capturedAt: 1,
+      updatedAt: 1,
+      origin: 'worktree-sleep'
+    }
+
+    const binding = connectPanePty(pane as never, manager as never, deps as never) as unknown as {
+      noteVisibilityResume: () => void
+      dispose: () => void
+    }
+    await flushAsyncTicks()
+
+    const onPtyExit = createdTransportOptions[0]?.onPtyExit as ((ptyId: string) => void) | undefined
+    expect(onPtyExit).toBeTypeOf('function')
+    expect((transport.getPtyId as unknown as () => string | null)()).toBe('tab-pty')
+    const connectCallsBeforeExit = transport.connect.mock.calls.length
+    onPtyExit?.('tab-pty')
+    await flushAsyncTicks()
+
+    // Another flow rebinds the pane to a fresh PTY while it is still hidden.
+    transport.getPtyId.mockReturnValue('pty-restarted')
+    binding.noteVisibilityResume()
+    await flushAsyncTicks()
+    // The rebound pane keeps its own session: no wake-driven resume spawn.
+    expect(transport.connect.mock.calls.length).toBe(connectCallsBeforeExit)
+
+    // The rebound PTY later dies without a new sleeping record; the stale wake
+    // must not fire on the next reveal.
+    transport.getPtyId.mockReturnValue(null)
+    binding.noteVisibilityResume()
+    await flushAsyncTicks()
+    expect(transport.connect.mock.calls.length).toBe(connectCallsBeforeExit)
+  })
+
   it('keeps a fresh split pane mounted when its newborn PTY exits before output or input', async () => {
     const { connectPanePty } = await import('./pty-connection')
     const transport = createMockTransport('pty-pane-2')

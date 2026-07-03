@@ -2957,6 +2957,71 @@ describe('shutdownWorktreeTerminals (sleep) — agent status hygiene', () => {
     expect(state.agentStatusByPaneKey[targetPaneKey]).toBeDefined()
   })
 
+  it('persists the sleeping record and suppression before issuing the hibernation kill', async () => {
+    // pty:exit can beat the kill promise back to the renderer, and the pane's
+    // exit handler arms the hibernation wake only if the sleeping record is
+    // already in the store. A record written after the kill resolves passes
+    // every end-state assertion while still losing that race, so this test
+    // observes the store at the moment the kill is issued.
+    const store = createTestStore()
+    const wt = 'repo1::/path/wt1'
+    const targetLeaf = '11111111-1111-4111-8111-111111111111'
+    const targetPaneKey = `tab-1:${targetLeaf}`
+
+    seedStore(store, {
+      worktreesByRepo: {
+        repo1: [makeWorktree({ id: wt, repoId: 'repo1', path: '/path/wt1' })]
+      },
+      tabsByWorktree: {
+        [wt]: [makeTab({ id: 'tab-1', worktreeId: wt, title: 'Claude', ptyId: 'pty-agent' })]
+      },
+      terminalLayoutsByTabId: {
+        'tab-1': {
+          root: { type: 'leaf', leafId: targetLeaf },
+          activeLeafId: targetLeaf,
+          expandedLeafId: null,
+          ptyIdsByLeafId: { [targetLeaf]: 'pty-agent' }
+        }
+      },
+      ptyIdsByTabId: { 'tab-1': ['pty-agent'] }
+    })
+    store
+      .getState()
+      .setAgentStatus(
+        targetPaneKey,
+        { state: 'done', prompt: 'resume target', agentType: 'claude' },
+        'Claude',
+        { updatedAt: 2000, stateStartedAt: 1000 },
+        { tabId: 'tab-1', worktreeId: wt },
+        { providerSession: { key: 'session_id', id: 'sess-ordering-1' } }
+      )
+    let recordAtKillTime: unknown = null
+    let suppressionAtKillTime: boolean | undefined
+    mockApi.pty.kill.mockImplementationOnce(async () => {
+      const atKill = store.getState()
+      recordAtKillTime = atKill.sleepingAgentSessionsByPaneKey[targetPaneKey]
+      suppressionAtKillTime = atKill.suppressedPtyExitIds['pty-agent']
+    })
+
+    await store.getState().shutdownCompletedAgentPaneForHibernation(wt, {
+      paneKey: targetPaneKey,
+      tabId: 'tab-1',
+      leafId: targetLeaf,
+      ptyId: 'pty-agent'
+    })
+
+    expect(mockApi.pty.kill).toHaveBeenCalledWith('pty-agent', { keepHistory: true })
+    expect(recordAtKillTime).toMatchObject({
+      paneKey: targetPaneKey,
+      providerSession: { key: 'session_id', id: 'sess-ordering-1' }
+    })
+    expect(suppressionAtKillTime).toBe(true)
+    // The record must survive the successful kill so the reveal-time wake can
+    // consume it.
+    const state = store.getState()
+    expect(state.sleepingAgentSessionsByPaneKey[targetPaneKey]).toBeDefined()
+  })
+
   it('keeps manual sleep worktree-wide', async () => {
     const store = createTestStore()
     const wt = 'repo1::/path/wt1'
